@@ -43,11 +43,15 @@ param deployRbac bool = true
 @secure()
 param acrPassword string = ''
 
+@description('MAA (Microsoft Azure Attestation) endpoint for the SKR sidecar')
+param maaEndpoint string = 'sharedeus.eus.attest.azure.net'
+
 // ── Variables ───────────────────────────────────────────────────
 var containerGroupName = '${namePrefix}-server'
 var keyVaultName = '${namePrefix}-kv-${uniqueString(resourceGroup().id)}'
 var managedIdentityName = '${namePrefix}-identity'
 var imageName = '${acrName}.azurecr.io/mcp-tee-server:${imageTag}'
+var skrImage = 'mcr.microsoft.com/aci/skr:2.9'
 
 // ── Managed Identity ────────────────────────────────────────────
 resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -75,47 +79,23 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-// ── Key Vault Secrets ───────────────────────────────────────────
-// In production, these are populated by your CI/CD pipeline or
-// a separate secure provisioning step. The key-release policy
-// ensures they can ONLY be read by attested confidential containers.
+// ── Key Vault Keys ───────────────────────────────────────────
+// Secrets are stored as exportable Key Vault keys with a release policy.
+// The SKR sidecar performs hardware attestation and calls AKV to release
+// them at runtime. Keys must be imported AFTER deployment using:
+//   az keyvault key import --vault-name <kv> --name <key-name> \
+//     --kty oct-HSM --ops export --exportable true \
+//     --policy infra/key-release-policy.json --value <base64-secret>
 
-resource githubTokenSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'github-token'
-  properties: {
-    value: '' // Populated externally — never in source control
-    contentType: 'text/plain'
-  }
-}
-
-resource dbConnectionSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'db-connection-string'
-  properties: {
-    value: '' // Populated externally
-    contentType: 'text/plain'
-  }
-}
-
-resource webhookUrlSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'webhook-url'
-  properties: {
-    value: '' // Populated externally
-    contentType: 'text/plain'
-  }
-}
-
-// ── RBAC: Grant the managed identity access to Key Vault secrets ─
-// Role: Key Vault Secrets User (4633458b-17de-408a-b874-0445c86b69e6)
+// ── RBAC: Grant the managed identity access to Key Vault key release ─
+// Role: Key Vault Crypto Service Release User (08bbd89a-735e-4713-a852-15bf7196a6c7)
 resource kvRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRbac) {
-  name: guid(keyVault.id, managedIdentity.id, '4633458b-17de-408a-b874-0445c86b69e6')
+  name: guid(keyVault.id, managedIdentity.id, '08bbd89a-735e-4713-a852-15bf7196a6c7')
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '4633458b-17de-408a-b874-0445c86b69e6'
+      '08bbd89a-735e-4713-a852-15bf7196a6c7'
     )
     principalId: managedIdentity.properties.principalId
     principalType: 'ServicePrincipal'
@@ -154,30 +134,46 @@ resource containerGroup 'Microsoft.ContainerInstance/containerGroups@2023-05-01'
               memoryInGB: 2
             }
           }
-          // Secrets injected as environment variables by the
-          // attestation sidecar AFTER successful attestation.
-          // These are placeholders — the sidecar overwrites them.
           environmentVariables: [
             {
-              name: 'GITHUB_TOKEN'
-              secureValue: '' // Injected by sidecar post-attestation
+              name: 'SKR_ENDPOINT'
+              value: 'http://localhost:9000'
             }
             {
-              name: 'DB_CONNECTION_STRING'
-              secureValue: '' // Injected by sidecar post-attestation
+              name: 'MAA_ENDPOINT'
+              value: maaEndpoint
             }
             {
-              name: 'WEBHOOK_URL'
-              secureValue: '' // Injected by sidecar post-attestation
-            }
-            {
-              name: 'AZURE_KEY_VAULT_URL'
+              name: 'AKV_ENDPOINT'
               value: keyVault.properties.vaultUri
             }
           ]
           ports: [
             {
               port: 8080
+              protocol: 'TCP'
+            }
+          ]
+        }
+      }
+      {
+        name: 'skr-sidecar'
+        properties: {
+          image: skrImage
+          resources: {
+            requests: {
+              cpu: 1
+              memoryInGB: 1
+            }
+          }
+          command: [
+            '/bin/skr'
+            '-port'
+            '9000'
+          ]
+          ports: [
+            {
+              port: 9000
               protocol: 'TCP'
             }
           ]

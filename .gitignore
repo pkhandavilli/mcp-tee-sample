@@ -30,3 +30,7 @@ node_modules/
 *.key
 *.p12
 *.pfx
+# Temporary deployment artifacts
+infra/params.json
+infra/main.json
+infra/main-resolved.json

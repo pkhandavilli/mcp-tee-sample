@@ -35,15 +35,79 @@ logging.basicConfig(
 logger = logging.getLogger("mcp-tee-server")
 
 # ── Secret Loading ──────────────────────────────────────────────
-# In production these come from AKV mHSM via the attestation sidecar.
-# The sidecar populates environment variables ONLY after the TEE
-# attestation succeeds and the key-release policy is satisfied.
+# In production, secrets are fetched from Azure Key Vault via the SKR
+# (Secure Key Release) sidecar. The sidecar performs hardware attestation
+# (AMD SEV-SNP → MAA token) and releases keys only when the key-release
+# policy is satisfied.
 #
-# For local development, set these in a .env file (never commit it).
+# For local development, set env vars directly (never commit them).
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-DB_CONNECTION_STRING = os.environ.get("DB_CONNECTION_STRING", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+SKR_ENDPOINT = os.environ.get("SKR_ENDPOINT", "http://localhost:9000")
+MAA_ENDPOINT = os.environ.get("MAA_ENDPOINT", "sharedeus.eus.attest.azure.net")
+AKV_ENDPOINT = os.environ.get("AKV_ENDPOINT", "")
+
+# Secret names as they appear in Key Vault (key IDs for SKR)
+_SECRET_KEY_MAP = {
+    "GITHUB_TOKEN": "github-token",
+    "DB_CONNECTION_STRING": "db-connection-string",
+    "WEBHOOK_URL": "webhook-url",
+}
+
+GITHUB_TOKEN = ""
+DB_CONNECTION_STRING = ""
+WEBHOOK_URL = ""
+_secrets_source: dict[str, str] = {}  # Tracks where each secret came from
+
+
+async def _fetch_secret_from_skr(kid: str) -> str | None:
+    """Fetch a secret from the SKR sidecar via hardware attestation.
+
+    The sidecar obtains an attestation report from /dev/sev-guest, sends it
+    to MAA, and uses the resulting token to release the key from AKV.
+    """
+    if not AKV_ENDPOINT:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SKR_ENDPOINT}/key/release",
+                json={
+                    "maa_endpoint": MAA_ENDPOINT,
+                    "akv_endpoint": AKV_ENDPOINT,
+                    "kid": kid,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("key", "")
+    except Exception as e:
+        logger.warning("SKR fetch failed for %s: %s", kid, e)
+        return None
+
+
+async def _load_secrets() -> None:
+    """Load secrets from SKR sidecar, falling back to environment variables."""
+    global GITHUB_TOKEN, DB_CONNECTION_STRING, WEBHOOK_URL
+
+    secrets = {}
+    for env_name, kid in _SECRET_KEY_MAP.items():
+        # Try SKR sidecar first (production path)
+        value = await _fetch_secret_from_skr(kid)
+        if value:
+            secrets[env_name] = value
+            _secrets_source[env_name] = "skr"
+            logger.info("Loaded %s via SKR sidecar", env_name)
+        else:
+            # Fall back to environment variable (local dev path)
+            value = os.environ.get(env_name, "")
+            secrets[env_name] = value
+            _secrets_source[env_name] = "env" if value else "none"
+            if value:
+                logger.info("Loaded %s from environment variable", env_name)
+
+    GITHUB_TOKEN = secrets.get("GITHUB_TOKEN", "")
+    DB_CONNECTION_STRING = secrets.get("DB_CONNECTION_STRING", "")
+    WEBHOOK_URL = secrets.get("WEBHOOK_URL", "")
 
 
 def _check_secrets() -> dict[str, bool]:
@@ -273,19 +337,26 @@ async def attestation_status() -> dict[str, Any]:
         "running_in_tee": tee_evidence or snp_evidence,
         "tee_type": "AMD SEV-SNP" if snp_evidence else ("TEE detected" if tee_evidence else "none detected"),
         "secrets_loaded": _check_secrets(),
+        "secrets_source": _secrets_source,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 # ── Entry Point ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    secrets = _check_secrets()
     logger.info("Starting MCP TEE Server")
-    logger.info("Secrets loaded: %s", json.dumps(secrets))
     logger.info(
         "TEE environment: /dev/sev-guest=%s",
         os.path.exists("/dev/sev-guest"),
     )
+
+    # Load secrets from SKR sidecar (or env vars for local dev)
+    asyncio.run(_load_secrets())
+
+    secrets = _check_secrets()
+    logger.info("Secrets loaded: %s", json.dumps(secrets))
+    logger.info("Secrets source: %s", json.dumps(_secrets_source))
+
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     if transport not in {"stdio", "streamable-http"}:
         logger.warning("Unknown MCP_TRANSPORT=%r, falling back to streamable-http", transport)
