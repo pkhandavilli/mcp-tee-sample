@@ -138,31 +138,41 @@ async def _fetch_envelope_key() -> dict | None:
             )
             resp.raise_for_status()
             access_token = resp.json().get("access_token")
-            logger.info("Acquired managed identity token for Key Vault")
+            logger.info("  ✅ Acquired managed identity token for Key Vault (token length: %d)", len(access_token or ""))
     except Exception as e:
-        logger.warning("Failed to acquire managed identity token: %s", e)
+        logger.warning("  ❌ Failed to acquire managed identity token: %s", e)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
+            akv_host = AKV_ENDPOINT.rstrip("/").replace("https://", "").replace("http://", "")
             payload = {
                 "maa_endpoint": MAA_ENDPOINT,
-                "akv_endpoint": AKV_ENDPOINT.rstrip("/").replace("https://", "").replace("http://", ""),
+                "akv_endpoint": akv_host,
                 "kid": ENVELOPE_KEY_NAME,
             }
             if access_token:
                 payload["access_token"] = access_token
+            logger.info("  → Calling SKR: POST %s/key/release", SKR_ENDPOINT)
+            logger.info("    MAA authority : %s", MAA_ENDPOINT)
+            logger.info("    Key Vault     : %s", akv_host)
+            logger.info("    Key name      : %s", ENVELOPE_KEY_NAME)
+            logger.info("    Flow: /dev/sev-guest → SNP report → MAA attestation → KV key release")
             resp = await client.post(
                 f"{SKR_ENDPOINT}/key/release",
                 json=payload,
             )
             if resp.status_code != 200:
                 body = resp.text
-                logger.warning("SKR key/release returned %d: %s", resp.status_code, body[:500])
+                logger.warning("  ❌ SKR key/release returned %d: %s", resp.status_code, body[:500])
                 return None
+            logger.info("  ✅ SKR returned 200 — hardware attestation passed, key released!")
             data = resp.json()
             key = data.get("key")
             if isinstance(key, str):
                 key = json.loads(key)
+            key_type = key.get("kty", "unknown") if key else "unknown"
+            key_size = len(_base64url_decode(key.get("n", ""))) * 8 if key and "n" in key else 0
+            logger.info("  Key type: %s, size: %d-bit", key_type, key_size)
             return key
     except Exception as e:
         logger.warning("SKR envelope key fetch failed: %s", e)
@@ -187,7 +197,8 @@ async def _load_secrets() -> None:
     if envelope_jwk:
         try:
             private_key = _jwk_to_private_key(envelope_jwk)
-            logger.info("Envelope key released via SKR — decrypting secrets")
+            logger.info("  ✅ RSA private key reconstructed from JWK")
+            logger.info("  Decrypting ENC_* environment variables with RSA-OAEP-256...")
 
             for env_name, enc_env_name in _ENCRYPTED_ENV_MAP.items():
                 enc_value = os.environ.get(enc_env_name, "")
@@ -195,9 +206,9 @@ async def _load_secrets() -> None:
                     try:
                         secrets[env_name] = _decrypt_secret(private_key, enc_value)
                         _secrets_source[env_name] = "skr+envelope"
-                        logger.info("Decrypted %s via envelope encryption", env_name)
+                        logger.info("  🔓 Decrypted %s (%d chars of ciphertext → plaintext in memory only)", env_name, len(enc_value))
                     except Exception as e:
-                        logger.warning("Failed to decrypt %s: %s", env_name, e)
+                        logger.warning("  ❌ Failed to decrypt %s: %s", env_name, e)
                         _secrets_source[env_name] = "decrypt_failed"
                 else:
                     _secrets_source[env_name] = "none (no ciphertext)"
@@ -451,29 +462,156 @@ async def attestation_status() -> dict[str, Any]:
     }
 
 
-# ── Entry Point ─────────────────────────────────────────────────
-if __name__ == "__main__":
-    logger.info("Starting MCP TEE Server")
-    logger.info(
-        "TEE environment: /dev/sev-guest=%s",
-        os.path.exists("/dev/sev-guest"),
-    )
+@mcp.tool()
+async def debug_skr_status() -> dict[str, Any]:
+    """
+    Diagnostic tool: probe the SKR sidecar and report detailed status.
+    Useful for troubleshooting attestation and key release issues.
+    """
+    result: dict[str, Any] = {
+        "skr_endpoint": SKR_ENDPOINT,
+        "maa_endpoint": MAA_ENDPOINT,
+        "akv_endpoint": AKV_ENDPOINT,
+        "envelope_key": ENVELOPE_KEY_NAME,
+    }
 
-    # Load secrets from SKR sidecar (or env vars for local dev)
+    # Check ENC_* env var presence (not values)
+    for name, enc_name in _ENCRYPTED_ENV_MAP.items():
+        val = os.environ.get(enc_name, "")
+        result[f"env_{enc_name}"] = f"present ({len(val)} chars)" if val else "EMPTY"
+
+    # Check SKR sidecar health
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{SKR_ENDPOINT}/status")
+            result["skr_status"] = {"code": resp.status_code, "body": resp.text[:200]}
+    except Exception as e:
+        result["skr_status"] = {"error": str(e)}
+
+    # Try IMDS token
+    identity_client_id = os.environ.get("IDENTITY_CLIENT_ID", "")
+    result["identity_client_id"] = identity_client_id or "not set"
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            params = {"api-version": "2018-02-01", "resource": "https://vault.azure.net"}
+            if identity_client_id:
+                params["client_id"] = identity_client_id
+            resp = await client.get(
+                "http://169.254.169.254/metadata/identity/oauth2/token",
+                params=params, headers={"Metadata": "true"},
+            )
+            result["imds_token"] = {"code": resp.status_code, "has_token": "access_token" in resp.text}
+    except Exception as e:
+        result["imds_token"] = {"error": str(e)}
+
+    # Try SKR key release
+    try:
+        access_token = None
+        async with httpx.AsyncClient(timeout=10) as client:
+            params = {"api-version": "2018-02-01", "resource": "https://vault.azure.net"}
+            if identity_client_id:
+                params["client_id"] = identity_client_id
+            resp = await client.get(
+                "http://169.254.169.254/metadata/identity/oauth2/token",
+                params=params, headers={"Metadata": "true"},
+            )
+            if resp.status_code == 200:
+                access_token = resp.json().get("access_token")
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            akv_host = AKV_ENDPOINT.rstrip("/").replace("https://", "").replace("http://", "")
+            payload = {
+                "maa_endpoint": MAA_ENDPOINT,
+                "akv_endpoint": akv_host,
+                "kid": ENVELOPE_KEY_NAME,
+            }
+            if access_token:
+                payload["access_token"] = access_token
+            resp = await client.post(f"{SKR_ENDPOINT}/key/release", json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                key = data.get("key")
+                if isinstance(key, str):
+                    key = json.loads(key)
+                result["key_release"] = {"code": 200, "key_type": key.get("kty") if key else "unknown"}
+            else:
+                result["key_release"] = {"code": resp.status_code, "body": resp.text[:500]}
+    except Exception as e:
+        result["key_release"] = {"error": str(e)}
+
+    return result
+
+
+# ── Entry Point ─────────────────────────────────────────────────
+_BANNER = """
+╔══════════════════════════════════════════════════════════════════╗
+║          MCP TEE Server — Confidential Container Demo           ║
+║                      OC3 2025 Reference                         ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+if __name__ == "__main__":
+    print(_BANNER, flush=True)
+
+    # ── Phase 1: TEE Detection ──────────────────────────────────
+    logger.info("▶ Phase 1/4 — TEE Detection")
+    sev_guest = os.path.exists("/dev/sev-guest")
+    sev_dev = os.path.exists("/dev/sev")
+    tee_sec = os.path.exists("/sys/kernel/security/tee")
+    logger.info("  /dev/sev-guest : %s", "✅ FOUND" if sev_guest else "❌ not found")
+    logger.info("  /dev/sev       : %s", "✅ FOUND" if sev_dev else "— not found")
+    if sev_guest:
+        logger.info("  ✅ Running inside AMD SEV-SNP Trusted Execution Environment")
+    else:
+        logger.info("  ⚠️  No TEE detected — running in plain container (dev mode)")
+
+    # ── Phase 2: Managed Identity ───────────────────────────────
+    logger.info("▶ Phase 2/4 — Managed Identity Token")
+    identity_client_id = os.environ.get("IDENTITY_CLIENT_ID", "")
+    if identity_client_id:
+        logger.info("  Identity client ID: %s...%s", identity_client_id[:8], identity_client_id[-4:])
+    else:
+        logger.info("  No IDENTITY_CLIENT_ID set — will use system-assigned identity")
+
+    # ── Phase 3: Secret Loading ─────────────────────────────────
+    logger.info("▶ Phase 3/4 — Envelope Encryption & Secret Loading")
+    logger.info("  SKR endpoint : %s", SKR_ENDPOINT)
+    logger.info("  MAA endpoint : %s", MAA_ENDPOINT)
+    logger.info("  AKV endpoint : %s", AKV_ENDPOINT[:40] + "..." if len(AKV_ENDPOINT) > 40 else AKV_ENDPOINT)
+    logger.info("  Envelope key : %s", ENVELOPE_KEY_NAME)
+    enc_count = sum(1 for v in _ENCRYPTED_ENV_MAP.values() if os.environ.get(v, ""))
+    logger.info("  Encrypted env vars found: %d/%d", enc_count, len(_ENCRYPTED_ENV_MAP))
+    logger.info("  Requesting SKR sidecar to perform attestation & key release...")
+
     asyncio.run(_load_secrets())
 
     secrets = _check_secrets()
-    logger.info("Secrets loaded: %s", json.dumps(secrets))
-    logger.info("Secrets source: %s", json.dumps(_secrets_source))
+    loaded = sum(1 for v in secrets.values() if v)
+    logger.info("  ──────────────────────────────────────────────")
+    for name, is_loaded in secrets.items():
+        src = _secrets_source.get(name, "unknown")
+        icon = "🔓" if is_loaded else "🔒"
+        logger.info("  %s %s : %s (via %s)", icon, name, "LOADED" if is_loaded else "NOT LOADED", src)
+    logger.info("  ──────────────────────────────────────────────")
+    if loaded == len(secrets):
+        logger.info("  ✅ All %d secrets decrypted inside TEE — never touched disk", loaded)
+    else:
+        logger.info("  ⚠️  %d/%d secrets loaded", loaded, len(secrets))
 
+    # ── Phase 4: MCP Transport ──────────────────────────────────
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     if transport not in {"stdio", "streamable-http"}:
         logger.warning("Unknown MCP_TRANSPORT=%r, falling back to streamable-http", transport)
         transport = "streamable-http"
-    logger.info("Transport: %s", transport)
+    logger.info("▶ Phase 4/4 — Starting MCP Transport")
+    logger.info("  Transport : %s", transport)
+    logger.info("  Tools     : github_search_issues, query_database, send_notification, attestation_status")
     if transport == "stdio":
+        logger.info("  Ready for stdio connections")
         mcp.run(transport="stdio")
     else:
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = 8080
+        logger.info("  Listening on http://0.0.0.0:8080/mcp")
+        logger.info("══════════════════════════════════════════════════════════════════")
         mcp.run(transport="streamable-http")

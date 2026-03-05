@@ -15,12 +15,14 @@
         {
           "claim": "x-ms-sevsnpvm-hostdata",
           "comment": "This value must match the SHA-256 hash of your CCE policy. Generate it with: az confcom acipolicy gen --image <image> | sha256sum",
-          "equals": "46ff8ce87f63ce3064dedeccb97437b90e9ad90e6fa04719a6cd081ca417a5e9"
+          "equals": "38f2144e453165278fd4fd37185a062f975c371e7b9f5dd01e3d948227f61638"
         }
       ]
     }
   ]
 }
+
+
 
 
 
