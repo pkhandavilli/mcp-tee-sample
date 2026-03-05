@@ -106,7 +106,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
           tenantId: subscription().tenantId
           objectId: deployerObjectId
           permissions: {
-            keys: [ 'get', 'list', 'create', 'import', 'update' ]
+            keys: [ 'get', 'list', 'create', 'import', 'update', 'delete', 'purge', 'encrypt', 'wrapKey', 'release' ]
           }
         }
       ] : []
@@ -180,6 +180,10 @@ resource containerGroup 'Microsoft.ContainerInstance/containerGroups@2023-05-01'
             {
               name: 'ENVELOPE_KEY_NAME'
               value: envelopeKeyName
+            }
+            {
+              name: 'IDENTITY_CLIENT_ID'
+              value: managedIdentity.properties.clientId
             }
             {
               name: 'ENC_GITHUB_TOKEN'

@@ -118,17 +118,47 @@ async def _fetch_envelope_key() -> dict | None:
     """
     if not AKV_ENDPOINT:
         return None
+
+    # Acquire an access token for Key Vault via managed identity (IMDS).
+    # User-assigned identities require the client_id parameter.
+    access_token = None
+    identity_client_id = os.environ.get("IDENTITY_CLIENT_ID", "")
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{SKR_ENDPOINT}/key/release",
-                json={
-                    "maa_endpoint": MAA_ENDPOINT,
-                    "akv_endpoint": AKV_ENDPOINT,
-                    "kid": ENVELOPE_KEY_NAME,
-                },
+        async with httpx.AsyncClient(timeout=10) as client:
+            params = {
+                "api-version": "2018-02-01",
+                "resource": "https://vault.azure.net",
+            }
+            if identity_client_id:
+                params["client_id"] = identity_client_id
+            resp = await client.get(
+                "http://169.254.169.254/metadata/identity/oauth2/token",
+                params=params,
+                headers={"Metadata": "true"},
             )
             resp.raise_for_status()
+            access_token = resp.json().get("access_token")
+            logger.info("Acquired managed identity token for Key Vault")
+    except Exception as e:
+        logger.warning("Failed to acquire managed identity token: %s", e)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            payload = {
+                "maa_endpoint": MAA_ENDPOINT,
+                "akv_endpoint": AKV_ENDPOINT.rstrip("/").replace("https://", "").replace("http://", ""),
+                "kid": ENVELOPE_KEY_NAME,
+            }
+            if access_token:
+                payload["access_token"] = access_token
+            resp = await client.post(
+                f"{SKR_ENDPOINT}/key/release",
+                json=payload,
+            )
+            if resp.status_code != 200:
+                body = resp.text
+                logger.warning("SKR key/release returned %d: %s", resp.status_code, body[:500])
+                return None
             data = resp.json()
             key = data.get("key")
             if isinstance(key, str):
